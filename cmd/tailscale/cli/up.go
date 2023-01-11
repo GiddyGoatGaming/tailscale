@@ -543,7 +543,12 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
-	watcher, err := localClient.WatchIPNBus(watchCtx, 0)
+	watcher, err := localClient.WatchIPNBus(watchCtx, ipn.NotifyInitialState)
+	if err != nil {
+		return err
+	}
+	// Read the initial state and throw it away, to make sure the watcher is watching before we call Start().
+	_, err = watcher.Next()
 	if err != nil {
 		return err
 	}
