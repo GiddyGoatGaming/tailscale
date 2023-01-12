@@ -1732,22 +1732,21 @@ func (b *LocalBackend) readPoller() {
 // WatchNotifications subscribes to the ipn.Notify message bus notification
 // messages.
 //
-// WatchNotifications blocks until ctx is done.
-//
-// The provided fn will only be called with non-nil pointers. The caller must
-// not modify roNotify. If fn returns false, the watch also stops.
+// The returned channel will only receive non-nil pointers. The caller must
+// not modify the values read from the channel.
 //
 // Failure to consume many notifications in a row will result in dropped
 // notifications. There is currently (2022-11-22) no mechanism provided to
 // detect when a message has been dropped.
-func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWatchOpt, fn func(roNotify *ipn.Notify) (keepGoing bool)) {
+func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWatchOpt) <-chan *ipn.Notify {
 	ch := make(chan *ipn.Notify, 128)
+	outch := make(chan *ipn.Notify, 128)
 
-	origFn := fn
+	filter := func(n *ipn.Notify) *ipn.Notify { return n }
 	if mask&ipn.NotifyNoPrivateKeys != 0 {
-		fn = func(n *ipn.Notify) bool {
+		filter = func(n *ipn.Notify) *ipn.Notify {
 			if n.NetMap == nil || n.NetMap.PrivateKey.IsZero() {
-				return origFn(n)
+				return n
 			}
 
 			// The netmap in n is shared across all watchers, so to mutate it for a
@@ -1757,7 +1756,7 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 			n2 := *n
 			n2.NetMap = &nm2
 			n2.NetMap.PrivateKey = key.NodePrivate{}
-			return origFn(&n2)
+			return &n2
 		}
 	}
 
@@ -1784,45 +1783,43 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 	handle := b.notifyWatchers.Add(ch)
 	b.mu.Unlock()
 
-	defer func() {
-		b.mu.Lock()
-		delete(b.notifyWatchers, handle)
-		b.mu.Unlock()
-	}()
-
 	if ini != nil {
-		if !fn(ini) {
-			return
+		outch <- filter(ini)
+	}
+
+	go func() {
+		// The GUI clients want to know when peers become active or inactive.
+		// They've historically got this information by polling for it, which is
+		// wasteful. As a step towards making it efficient, they now set this
+		// NotifyWatchEngineUpdates bit to ask for us to send it to them only on
+		// change. That's not yet (as of 2022-11-26) plumbed everywhere in
+		// tailscaled yet, so just do the polling here. This ends up causing all IPN
+		// bus watchers to get the notification every 2 seconds instead of just the
+		// GUI client's bus watcher, but in practice there's only 1 total connection
+		// anyway. And if we're polling, at least the client isn't making a new HTTP
+		// request every 2 seconds.
+		// TODO(bradfitz): plumb this further and only send a Notify on change.
+		if mask&ipn.NotifyWatchEngineUpdates != 0 {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			go b.pollRequestEngineStatus(ctx)
 		}
-	}
 
-	// The GUI clients want to know when peers become active or inactive.
-	// They've historically got this information by polling for it, which is
-	// wasteful. As a step towards making it efficient, they now set this
-	// NotifyWatchEngineUpdates bit to ask for us to send it to them only on
-	// change. That's not yet (as of 2022-11-26) plumbed everywhere in
-	// tailscaled yet, so just do the polling here. This ends up causing all IPN
-	// bus watchers to get the notification every 2 seconds instead of just the
-	// GUI client's bus watcher, but in practice there's only 1 total connection
-	// anyway. And if we're polling, at least the client isn't making a new HTTP
-	// request every 2 seconds.
-	// TODO(bradfitz): plumb this further and only send a Notify on change.
-	if mask&ipn.NotifyWatchEngineUpdates != 0 {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		go b.pollRequestEngineStatus(ctx)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case n := <-ch:
-			if !fn(n) {
+		for {
+			select {
+			case <-ctx.Done():
+				b.mu.Lock()
+				delete(b.notifyWatchers, handle)
+				b.mu.Unlock()
 				return
+			case n := <-ch:
+				outch <- filter(n)
 			}
 		}
-	}
+
+	}()
+
+	return outch
 }
 
 // pollRequestEngineStatus calls b.RequestEngineStatus every 2 seconds until ctx

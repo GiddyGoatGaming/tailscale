@@ -679,8 +679,6 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a flusher", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	f.Flush()
 
 	var mask ipn.NotifyWatchOpt
 	if s := r.FormValue("mask"); s != "" {
@@ -691,19 +689,23 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 		}
 		mask = ipn.NotifyWatchOpt(v)
 	}
-	ctx := r.Context()
-	h.b.WatchNotifications(ctx, mask, func(roNotify *ipn.Notify) (keepGoing bool) {
-		js, err := json.Marshal(roNotify)
+
+	ch := h.b.WatchNotifications(r.Context(), mask)
+
+	w.Header().Set("Content-Type", "application/json")
+	f.Flush()
+
+	for n := range ch {
+		js, err := json.Marshal(n)
 		if err != nil {
 			h.logf("json.Marshal: %v", err)
-			return false
+			return
 		}
 		if _, err := fmt.Fprintf(w, "%s\n", js); err != nil {
-			return false
+			return
 		}
 		f.Flush()
-		return true
-	})
+	}
 }
 
 func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) {
